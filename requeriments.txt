@@ -1,8 +1,0 @@
-Flask
-numpy
-Pillow
-scikit-image
-scikit-learn
-matplotlib
-seaborn
-tqdm
