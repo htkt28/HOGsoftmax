@@ -16,7 +16,7 @@ CELLS_PER_BLOCK = (2, 2)
 ORIENTATIONS = 9
 
 # ---------------- Tải Model đã huấn luyện ----------------
-MODEL_PATH = os.path.join("outputs", "softmax_model_hog_improved.pkl")
+MODEL_PATH = os.path.join("outputs", "softmax_model_hog_hist.pkl")
 
 
 # Dùng cache của Streamlit để chỉ tải model một lần
