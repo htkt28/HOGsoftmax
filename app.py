@@ -14,6 +14,7 @@ HOG_IMG_SIZE = (128, 64)
 PIXELS_PER_CELL = (16, 16)
 CELLS_PER_BLOCK = (2, 2)
 ORIENTATIONS = 9
+COLOR_BINS = 32  # <-- THÊM MỚI: Phải khớp với file train
 
 # ---------------- Tải Model đã huấn luyện ----------------
 MODEL_PATH = os.path.join("outputs", "softmax_model_hog_hist.pkl")
@@ -25,13 +26,22 @@ def load_model():
     if not os.path.exists(MODEL_PATH):
         # Hiển thị lỗi trên giao diện Streamlit
         st.error(f"Lỗi: Không tìm thấy file model tại '{MODEL_PATH}'")
+        st.error("Vui lòng đảm bảo file model đã được đẩy lên GitHub và nằm trong thư mục 'outputs'.")
         st.stop()  # Dừng ứng dụng
 
     print(f"Đang tải model từ {MODEL_PATH}...")
-    with open(MODEL_PATH, "rb") as f:
-        model_data = pickle.load(f)
-    print("Tải model thành công.")
-    return model_data
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            model_data = pickle.load(f)
+        print("Tải model thành công.")
+        return model_data
+    except FileNotFoundError:
+        st.error(f"Lỗi FileNotFoundError: Không tìm thấy file model tại '{MODEL_PATH}'.")
+        st.error("Hãy kiểm tra lại đường dẫn và đảm bảo file đã được commit lên GitHub.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Lỗi khi tải model: {e}")
+        st.stop()
 
 
 model_data = load_model()
@@ -54,8 +64,12 @@ def softmax_np(z):
     return e / np.sum(e, axis=1, keepdims=True)
 
 
-# ---------------- Hàm trích xuất đặc trưng HOG (Lấy từ file train) ----------------
+# ---------------- Hàm trích xuất đặc trưng HOG (ĐÃ CẬP NHẬT) ----------------
 def extract_hog_features(img_pil):
+    """
+    Trích xuất đặc trưng HOG (ảnh xám) + Color Histogram (ảnh màu).
+    Phải giống hệt hàm _worker_process_hog trong file huấn luyện.
+    """
     try:
         img = np.array(img_pil)
         if img.ndim == 3 and img.shape[2] == 4:
@@ -64,13 +78,36 @@ def extract_hog_features(img_pil):
         resized_img = resize(img, HOG_IMG_SIZE, anti_aliasing=True)
         gray_img = rgb2gray(resized_img) if resized_img.ndim == 3 else resized_img
 
-        features = hog(gray_img, orientations=ORIENTATIONS,
-                       pixels_per_cell=PIXELS_PER_CELL,
-                       cells_per_block=CELLS_PER_BLOCK,
-                       block_norm='L2-Hys',
-                       visualize=False,
-                       transform_sqrt=True)
+        # --- 1. Trích xuất HOG (từ ảnh xám) ---
+        features_hog = hog(gray_img, orientations=ORIENTATIONS,
+                           pixels_per_cell=PIXELS_PER_CELL,
+                           cells_per_block=CELLS_PER_BLOCK,
+                           block_norm='L2-Hys',
+                           visualize=False,
+                           transform_sqrt=True)
+
+        # --- 2. Trích xuất Color Histogram (từ ảnh màu) ---
+        if resized_img.ndim == 3 and resized_img.shape[2] == 3:
+            # Chuyển đổi ảnh về 0-255 để tính histogram
+            img_uint8 = (resized_img * 255).astype(np.uint8)
+
+            hist_r = np.histogram(img_uint8[:, :, 0], bins=COLOR_BINS, range=(0, 256))[0]
+            hist_g = np.histogram(img_uint8[:, :, 1], bins=COLOR_BINS, range=(0, 256))[0]
+            hist_b = np.histogram(img_uint8[:, :, 2], bins=COLOR_BINS, range=(0, 256))[0]
+
+            features_color_raw = np.concatenate((hist_r, hist_g, hist_b))
+
+            # Chuẩn hóa L1 cho histogram
+            features_color = features_color_raw / (features_color_raw.sum() + 1e-6)
+        else:
+            # Nếu ảnh gốc là ảnh xám (hoặc 1 kênh), tạo vector 0
+            features_color = np.zeros(COLOR_BINS * 3)
+
+        # --- 3. Nối 2 đặc trưng ---
+        features = np.concatenate((features_hog, features_color))  # -> 756 + 96 = 852
+
         return features
+
     except Exception as e:
         print(f"Lỗi khi trích xuất HOG: {e}")
         return None
@@ -78,7 +115,7 @@ def extract_hog_features(img_pil):
 
 # ---------------- Xây dựng giao diện Streamlit ----------------
 
-st.title("Phân loại ảnh điện thoại (HOG + Softmax)")
+st.title("Phân loại ảnh điện thoại (HOG + Histogram)")
 
 # 1. Tạo nút tải file
 uploaded_file = st.file_uploader("Chọn một ảnh để dự đoán:",
@@ -92,24 +129,30 @@ if uploaded_file is not None:
     # 3. Tạo nút dự đoán
     if st.button("Dự đoán"):
         # 4. Xử lý và dự đoán
-        with st.spinner("Đang trích xuất đặc trưng HOG và dự đoán..."):
+        with st.spinner("Đang trích xuất đặc trưng HOG + Histogram và dự đoán..."):
             features = extract_hog_features(img_pil)
 
             if features is None:
                 st.error("Không thể xử lý ảnh này.")
             else:
                 # Chuẩn hóa đặc trưng
-                features_2d = features.reshape(1, -1)
-                features_std = (features_2d - mean) / (std + 1e-12)
+                features_2d = features.reshape(1, -1)  # -> (1, 852)
 
-                # Dự đoán
-                scores = features_std @ W + b
-                probs = softmax_np(scores)
+                # Kiểm tra kích thước trước khi chuẩn hóa
+                if features_2d.shape[1] != mean.shape[1]:
+                    st.error(
+                        f"Lỗi kích thước đặc trưng! Model mong đợi {mean.shape[1]}, nhưng nhận được {features_2d.shape[1]}.")
+                else:
+                    features_std = (features_2d - mean) / (std + 1e-12)
 
-                pred_index = np.argmax(probs, axis=1)[0]
-                prediction_label = inv_label_map[pred_index]
-                probability = np.max(probs) * 100
+                    # Dự đoán
+                    scores = features_std @ W + b
+                    probs = softmax_np(scores)
 
-                # 5. Hiển thị kết quả
-                st.success(f"**Kết quả:** '{prediction_label}'")
-                st.info(f"**Độ tin cậy:** {probability:.2f}%")
+                    pred_index = np.argmax(probs, axis=1)[0]
+                    prediction_label = inv_label_map[pred_index]
+                    probability = np.max(probs) * 100
+
+                    # 5. Hiển thị kết quả
+                    st.success(f"**Kết quả:** '{prediction_label}'")
+                    st.info(f"**Độ tin cậy:** {probability:.2f}%")
